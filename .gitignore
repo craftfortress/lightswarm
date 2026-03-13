@@ -1,0 +1,19 @@
+# Environment
+.env
+
+# Logs
+logs/*.log
+
+# Project working directories (contain generated swarm state)
+projects/*/.swarm/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

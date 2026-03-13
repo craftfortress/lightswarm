@@ -1,0 +1,234 @@
+#!/bin/bash
+# =============================================================================
+# lightswarm - Claude Code Pipeline Orchestrator
+# =============================================================================
+# Runs an ARCHITECT -> BUILDER -> JANITOR pipeline on a project using
+# Claude Code CLI. Each step is a single --print invocation that reads/writes
+# handoff files in the project's .swarm/ directory.
+#
+# Usage:
+#   lightswarm PROJECT                # Full pipeline on PROJECT
+#   lightswarm PROJECT --architect    # Architect only (task selection)
+#   lightswarm PROJECT --builder      # Builder only (requires .swarm/current_task.md)
+#   lightswarm PROJECT --janitor      # Janitor only (requires .swarm/build_report.md)
+#   lightswarm --all                  # All projects with changed TODO.md
+#   lightswarm --all --force          # All projects regardless of changes
+# =============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- Configuration (override via .env or environment) ---
+
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+LIGHTSWARM_PROJECTS_DIR="${LIGHTSWARM_PROJECTS_DIR:-$SCRIPT_DIR/projects}"
+LIGHTSWARM_MODEL="${LIGHTSWARM_MODEL:-sonnet}"
+LIGHTSWARM_CLAUDE_BIN="${LIGHTSWARM_CLAUDE_BIN:-claude}"
+
+PROMPTS_DIR="$SCRIPT_DIR/prompts"
+LOG_DIR="$SCRIPT_DIR/logs"
+TODAY=$(date +%Y-%m-%d)
+
+# Claude Code flags
+CLAUDE_FLAGS=(--print --dangerously-skip-permissions --model "$LIGHTSWARM_MODEL" --no-session-persistence)
+
+# Ensure ANTHROPIC_API_KEY is unset so Claude Code uses Max subscription
+# If you're using API billing instead, comment this out and set the key in .env
+unset ANTHROPIC_API_KEY 2>/dev/null || true
+# Allow running from within a Claude Code session
+unset CLAUDECODE 2>/dev/null || true
+
+# --- Helpers ---
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+die() { log "ERROR: $*" >&2; exit 1; }
+
+ensure_dirs() {
+    mkdir -p "$LOG_DIR"
+}
+
+discover_projects() {
+    # Auto-discover projects: any directory under PROJECTS_DIR containing TODO.md
+    local projects=()
+    for dir in "$LIGHTSWARM_PROJECTS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name
+        name=$(basename "$dir")
+        # Skip hidden directories
+        [[ "$name" == .* ]] && continue
+        projects+=("$name")
+    done
+    echo "${projects[*]}"
+}
+
+resolve_project_dir() {
+    local project="$1"
+    local dir="$LIGHTSWARM_PROJECTS_DIR/$project"
+    [[ -d "$dir" ]] || die "Project directory not found: $dir"
+    echo "$dir"
+}
+
+ensure_swarm_dir() {
+    local project_dir="$1"
+    mkdir -p "$project_dir/.swarm"
+}
+
+has_todo_changed() {
+    local project_dir="$1"
+    local todo="$project_dir/TODO.md"
+    local timestamp="$project_dir/.swarm/last_run_timestamp"
+
+    # No TODO.md = nothing to do
+    [[ -f "$todo" ]] || return 1
+
+    # No timestamp = never run = changed
+    [[ -f "$timestamp" ]] || return 0
+
+    # Compare mtime: TODO.md newer than timestamp?
+    [[ "$todo" -nt "$timestamp" ]]
+}
+
+run_stage() {
+    local stage="$1"
+    local project_dir="$2"
+    local project_name="$3"
+    local prompt_file="$PROMPTS_DIR/${stage}.md"
+    local log_file="$LOG_DIR/${project_name}_${stage}_${TODAY}.log"
+
+    [[ -f "$prompt_file" ]] || die "Prompt file not found: $prompt_file"
+
+    local prompt
+    prompt=$(cat "$prompt_file")
+
+    log "[$project_name] Running $stage..."
+
+    # Run Claude Code from the project directory
+    if (
+        cd "$project_dir"
+        "$LIGHTSWARM_CLAUDE_BIN" "${CLAUDE_FLAGS[@]}" "$prompt"
+    ) >> "$log_file" 2>&1; then
+        log "[$project_name] $stage completed (exit 0)"
+        return 0
+    else
+        local exit_code=$?
+        log "[$project_name] $stage failed (exit $exit_code) - see $log_file"
+        return $exit_code
+    fi
+}
+
+# --- Pipeline ---
+
+run_pipeline() {
+    local project="$1"
+    local stages=("${@:2}")
+    local project_dir
+    project_dir=$(resolve_project_dir "$project")
+
+    ensure_swarm_dir "$project_dir"
+
+    log "[$project] Starting pipeline: ${stages[*]}"
+
+    for stage in "${stages[@]}"; do
+        if ! run_stage "$stage" "$project_dir" "$project"; then
+            log "[$project] Pipeline halted at $stage"
+            return 1
+        fi
+    done
+
+    # Update timestamp on successful completion
+    touch "$project_dir/.swarm/last_run_timestamp"
+    log "[$project] Pipeline complete"
+}
+
+run_all() {
+    local force="${1:-false}"
+    local ran=0
+    local skipped=0
+    local failed=0
+
+    local all_projects
+    all_projects=$(discover_projects)
+
+    if [[ -z "$all_projects" ]]; then
+        log "No projects found in $LIGHTSWARM_PROJECTS_DIR"
+        return 0
+    fi
+
+    for project in $all_projects; do
+        local project_dir="$LIGHTSWARM_PROJECTS_DIR/$project"
+
+        ensure_swarm_dir "$project_dir"
+
+        if [[ "$force" != "true" ]] && ! has_todo_changed "$project_dir"; then
+            log "[$project] TODO.md unchanged since last run, skipping"
+            ((skipped++))
+            continue
+        fi
+
+        if run_pipeline "$project" architect builder janitor; then
+            ((ran++))
+        else
+            ((failed++))
+        fi
+    done
+
+    log "Summary: $ran succeeded, $skipped skipped, $failed failed"
+}
+
+# --- Main ---
+
+ensure_dirs
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage:"
+    echo "  lightswarm PROJECT                # Full pipeline"
+    echo "  lightswarm PROJECT --architect    # Architect only"
+    echo "  lightswarm PROJECT --builder      # Builder only"
+    echo "  lightswarm PROJECT --janitor      # Janitor only"
+    echo "  lightswarm --all                  # Changed projects only"
+    echo "  lightswarm --all --force          # All projects"
+    exit 0
+fi
+
+case "$1" in
+    --all)
+        force=false
+        [[ "${2:-}" == "--force" ]] && force=true
+        run_all "$force"
+        ;;
+    --help|-h)
+        echo "LIGHTSWARM - Claude Code Pipeline Orchestrator"
+        echo ""
+        echo "Usage:"
+        echo "  lightswarm PROJECT                # Full pipeline"
+        echo "  lightswarm PROJECT --architect    # Architect only"
+        echo "  lightswarm PROJECT --builder      # Builder only"
+        echo "  lightswarm PROJECT --janitor      # Janitor only"
+        echo "  lightswarm --all                  # Changed projects only"
+        echo "  lightswarm --all --force          # All projects"
+        echo ""
+        echo "Environment:"
+        echo "  LIGHTSWARM_PROJECTS_DIR   Directory containing project folders (default: ./projects)"
+        echo "  LIGHTSWARM_MODEL          Claude model to use (default: sonnet)"
+        echo "  LIGHTSWARM_CLAUDE_BIN     Path to claude binary (default: claude)"
+        ;;
+    *)
+        project="$1"
+        stage="${2:-}"
+
+        case "$stage" in
+            --architect) run_pipeline "$project" architect ;;
+            --builder)   run_pipeline "$project" builder ;;
+            --janitor)   run_pipeline "$project" janitor ;;
+            "")          run_pipeline "$project" architect builder janitor ;;
+            *)           die "Unknown option: $stage" ;;
+        esac
+        ;;
+esac

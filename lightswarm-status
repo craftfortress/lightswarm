@@ -1,0 +1,150 @@
+#!/bin/bash
+# =============================================================================
+# lightswarm-status - Show recent pipeline run results
+# =============================================================================
+# Displays last run time, pipeline status, and task summary for each project.
+#
+# Usage:
+#   lightswarm-status              # Overview of all projects
+#   lightswarm-status PROJECT      # Detailed view for one project
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+    set -a
+    source "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+LIGHTSWARM_PROJECTS_DIR="${LIGHTSWARM_PROJECTS_DIR:-$SCRIPT_DIR/projects}"
+LOG_DIR="$SCRIPT_DIR/logs"
+
+# Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
+NC='\033[0m'
+
+discover_projects() {
+    for dir in "$LIGHTSWARM_PROJECTS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        local name
+        name=$(basename "$dir")
+        [[ "$name" == .* ]] && continue
+        echo "$name"
+    done
+}
+
+show_project() {
+    local project="$1"
+    local detailed="${2:-false}"
+    local project_dir="$LIGHTSWARM_PROJECTS_DIR/$project"
+    local swarm_dir="$project_dir/.swarm"
+
+    # Last run time
+    local last_run="never"
+    if [[ -f "$swarm_dir/last_run_timestamp" ]]; then
+        if [[ "$(uname)" == "Darwin" ]]; then
+            last_run=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$swarm_dir/last_run_timestamp" 2>/dev/null || echo "unknown")
+        else
+            last_run=$(stat -c "%y" "$swarm_dir/last_run_timestamp" 2>/dev/null | cut -d. -f1 || echo "unknown")
+        fi
+    fi
+
+    # TODO.md task counts
+    local todo_status="${DIM}no TODO.md${NC}"
+    if [[ -f "$project_dir/TODO.md" ]]; then
+        local pending_count done_count
+        pending_count=$(grep -cE '^\*\*Status\*\*:\s*(PENDING|NOT STARTED)' "$project_dir/TODO.md" 2>/dev/null || echo "0")
+        done_count=$(grep -cE '^\*\*Status\*\*:\s*DONE' "$project_dir/TODO.md" 2>/dev/null || echo "0")
+        todo_status="${pending_count} open, ${done_count} done"
+    fi
+
+    # Current task
+    local task_summary="none"
+    if [[ -f "$swarm_dir/current_task.md" ]]; then
+        task_summary=$(grep '^## Task' -A 1 "$swarm_dir/current_task.md" 2>/dev/null | tail -1 | head -c 60)
+        [[ -z "$task_summary" ]] && task_summary="(could not parse)"
+    fi
+
+    # Build status
+    local build_status="${DIM}no report${NC}"
+    if [[ -f "$swarm_dir/build_report.md" ]]; then
+        local status_line
+        status_line=$(grep -i '^## \(Overall \)\?Status' -A 1 "$swarm_dir/build_report.md" 2>/dev/null | tail -1 | tr -d '[:space:]')
+        case "$status_line" in
+            *COMPLETED*|*CLEAN*)    build_status="${GREEN}$status_line${NC}" ;;
+            *PARTIAL*|*NEEDS*)      build_status="${YELLOW}$status_line${NC}" ;;
+            *FAILED*|*REVERTED*)    build_status="${RED}$status_line${NC}" ;;
+            *SKIPPED*)              build_status="${DIM}SKIPPED${NC}" ;;
+            *)                      build_status="${DIM}unknown${NC}" ;;
+        esac
+    fi
+
+    # Change detection
+    local change_indicator=""
+    if [[ -f "$project_dir/TODO.md" ]]; then
+        if [[ ! -f "$swarm_dir/last_run_timestamp" ]] || [[ "$project_dir/TODO.md" -nt "$swarm_dir/last_run_timestamp" ]]; then
+            change_indicator="${YELLOW} (changed)${NC}"
+        fi
+    fi
+
+    printf "  ${CYAN}%-16s${NC} last: %-18s tasks: %-16s status: %b%b\n" \
+        "$project" "$last_run" "$todo_status" "$build_status" "$change_indicator"
+
+    if [[ "$detailed" == "true" ]]; then
+        echo ""
+        if [[ "$task_summary" != "none" ]]; then
+            echo "  Last task: $task_summary"
+        fi
+        if [[ -f "$swarm_dir/build_report.md" ]]; then
+            echo ""
+            echo "  --- Build Report ---"
+            sed 's/^/  /' "$swarm_dir/build_report.md" | head -40
+            local total_lines
+            total_lines=$(wc -l < "$swarm_dir/build_report.md")
+            if [[ "$total_lines" -gt 40 ]]; then
+                echo "  ... ($((total_lines - 40)) more lines)"
+            fi
+        fi
+        echo ""
+        echo "  --- Recent Logs ---"
+        local found_logs=false
+        for stage in architect builder janitor; do
+            local latest_log
+            latest_log=$(ls -t "$LOG_DIR/${project}_${stage}_"*.log 2>/dev/null | head -1)
+            if [[ -n "$latest_log" ]]; then
+                local log_size log_date
+                log_size=$(wc -c < "$latest_log" | tr -d ' ')
+                if [[ "$(uname)" == "Darwin" ]]; then
+                    log_date=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$latest_log" 2>/dev/null || echo "?")
+                else
+                    log_date=$(stat -c "%y" "$latest_log" 2>/dev/null | cut -d. -f1 || echo "?")
+                fi
+                printf "  %-10s %s (%s bytes)\n" "$stage:" "$log_date" "$log_size"
+                found_logs=true
+            fi
+        done
+        if [[ "$found_logs" == "false" ]]; then
+            echo "  No logs found"
+        fi
+    fi
+}
+
+echo ""
+echo "lightswarm status"
+echo "================="
+echo ""
+
+if [[ $# -ge 1 && "$1" != "--all" ]]; then
+    show_project "$1" true
+else
+    for project in $(discover_projects); do
+        show_project "$project"
+    done
+fi
+
+echo ""
